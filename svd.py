@@ -205,19 +205,25 @@ class SVDAutoRegressiveModel(pl.LightningModule):
         batch, k, token_dim = svd_tokens.shape
         image_size = self.image_size
         # Split tokens into u, sigma, v.
-        u = svd_tokens[..., :image_size]  # shape: (batch, k, image_size)
-        sigma = svd_tokens[..., image_size:image_size + 1]  # shape: (batch, k, 1)
-        v = svd_tokens[..., image_size + 1:]  # shape: (batch, k, image_size)
+        u = svd_tokens[..., :image_size]  # (batch, k, image_size)
+        sigma = svd_tokens[..., image_size:image_size + 1]  # (batch, k, 1)
+        v = svd_tokens[..., image_size + 1:]  # (batch, k, image_size)
 
-        # Reconstruct each image as the sum of sigma_i * (u_i outer v_i)
+        # Normalize u and v to enforce unit norm.
+        u = u / (u.norm(dim=2, keepdim=True) + 1e-8)
+        v = v / (v.norm(dim=2, keepdim=True) + 1e-8)
+        # Ensure singular values are nonnegative.
+        sigma = torch.relu(sigma)
+
+        # Reconstruct the image as a sum of outer products.
         reconstructed = 0
         for i in range(k):
             u_i = u[:, i, :]  # (batch, image_size)
             v_i = v[:, i, :]  # (batch, image_size)
             sigma_i = sigma[:, i, :]  # (batch, 1)
             # Compute outer product: (batch, image_size, 1) * (batch, 1, image_size)
-            u_i = u_i.unsqueeze(2)
-            v_i = v_i.unsqueeze(1)
+            u_i = u_i.unsqueeze(2)  # (batch, image_size, 1)
+            v_i = v_i.unsqueeze(1)  # (batch, 1, image_size)
             outer = u_i * v_i  # (batch, image_size, image_size)
             reconstructed = reconstructed + sigma_i.unsqueeze(-1) * outer
         return reconstructed
