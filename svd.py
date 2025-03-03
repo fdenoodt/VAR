@@ -9,6 +9,7 @@ import torch.linalg as linalg  # for SVD
 
 torch.set_float32_matmul_precision('medium')
 
+
 # --------------------------
 # Dataset: CIFAR10 with SVD targets
 # --------------------------
@@ -41,8 +42,8 @@ class CIFAR10SVDDataset(Dataset):
         # For each singular triplet i: u_i = U[:, i], sigma = S[i], v_i = V[i, :]
         # For convenience, we transpose U so that each row corresponds to one component.
         U_k = U[:, :k].transpose(0, 1)  # shape: [k, 32]
-        S_k = S[:k].unsqueeze(1)         # shape: [k, 1]
-        V_k = V[:k, :]                   # shape: [k, 32]
+        S_k = S[:k].unsqueeze(1)  # shape: [k, 1]
+        V_k = V[:k, :]  # shape: [k, 32]
 
         # Enforce a simple sign convention: ensure the first element of u is nonnegative.
         for i in range(k):
@@ -55,24 +56,22 @@ class CIFAR10SVDDataset(Dataset):
         # Return the original image (for conditioning) and the SVD token sequence.
         return img, target_seq
 
+
 # --------------------------
 # Lightning Module: SVD Autoregressive Model
 # --------------------------
 class SVDAutoRegressiveModel(pl.LightningModule):
     def __init__(self, latent_dim=128, k_components=10, image_size=32):
-        """
-        latent_dim: dimension of the latent code from the encoder.
-        k_components: number of SVD components (tokens) to predict.
-        image_size: dimension of the image (assumed square).
-        """
         super().__init__()
         self.k_components = k_components
         self.image_size = image_size
         # Each token consists of: u (image_size-dim), sigma (1-dim), v (image_size-dim)
         self.token_dim = image_size + 1 + image_size  # 32 + 1 + 32 = 65
 
+        # Weight for image reconstruction loss
+        self.lambda_recon = 0.1
+
         # --- Encoder ---
-        # A simple convnet to encode the grayscale image into a latent vector.
         self.encoder = nn.Sequential(
             nn.Conv2d(1, 32, kernel_size=3, stride=2, padding=1),  # 32x16x16
             nn.ReLU(),
@@ -86,18 +85,16 @@ class SVDAutoRegressiveModel(pl.LightningModule):
         )
 
         # --- Decoder ---
-        # We use an LSTM to autoregressively predict the SVD tokens.
         self.decoder_embedding = nn.Linear(self.token_dim, latent_dim)
         self.lstm = nn.LSTM(latent_dim, latent_dim, batch_first=True)
         self.output_layer = nn.Linear(latent_dim, self.token_dim)
 
         # A learned start token (initial input to the LSTM decoder)
         self.start_token = nn.Parameter(torch.zeros(1, self.token_dim))
-        # Initialize hidden and cell states from the encoder latent vector
         self.latent_to_hidden = nn.Linear(latent_dim, latent_dim)
         self.latent_to_cell = nn.Linear(latent_dim, latent_dim)
 
-        # Loss function: mean squared error between predicted and target tokens.
+        # Loss function: MSE between predicted and target tokens.
         self.criterion = nn.MSELoss()
 
     def forward(self, x, target_seq=None, teacher_forcing_ratio=0.5):
@@ -112,7 +109,7 @@ class SVDAutoRegressiveModel(pl.LightningModule):
 
         # Initialize LSTM hidden state (h0, c0) from latent vector.
         h0 = self.latent_to_hidden(latent).unsqueeze(0)  # shape: (1, batch, latent_dim)
-        c0 = self.latent_to_cell(latent).unsqueeze(0)      # shape: (1, batch, latent_dim)
+        c0 = self.latent_to_cell(latent).unsqueeze(0)  # shape: (1, batch, latent_dim)
 
         outputs = []
         # Expand the learned start token for the entire batch.
@@ -139,20 +136,36 @@ class SVDAutoRegressiveModel(pl.LightningModule):
     def training_step(self, batch, batch_idx):
         img, target_seq = batch
         outputs = self.forward(img, target_seq)
-        loss = self.criterion(outputs, target_seq)
-        self.log("train_loss", loss)
+        token_loss = self.criterion(outputs, target_seq)
 
+        # Reconstruct image from predicted SVD tokens.
+        reconstructed_img = self.reconstruct_from_svd_tokens(outputs)
+        # x: (batch, 1, H, W) --> squeeze channel dimension: (batch, H, W)
+        recon_loss = F.mse_loss(reconstructed_img, img.squeeze(1))
+
+        # Combined loss.
+        loss = token_loss + self.lambda_recon * recon_loss
+        self.log("train_loss", loss)
+        self.log("token_loss", token_loss)
+        self.log("recon_loss", recon_loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
         img, target_seq = batch
         outputs = self.forward(img, target_seq, teacher_forcing_ratio=0.0)
-        loss = self.criterion(outputs, target_seq)
-        self.log("val_loss", loss)
+        token_loss = self.criterion(outputs, target_seq)
 
-        # print loss every 100 steps
+        reconstructed_img = self.reconstruct_from_svd_tokens(outputs)
+        recon_loss = F.mse_loss(reconstructed_img, img.squeeze(1))
+
+        loss = token_loss + self.lambda_recon * recon_loss
+        self.log("val_loss", loss)
+        self.log("val_token_loss", token_loss)
+        self.log("val_recon_loss", recon_loss)
+
         if batch_idx % 100 == 0:
-            print(f"Epoch {self.current_epoch}, Step {batch_idx}, Loss: {loss.item()}")
+            print(
+                f"Epoch {self.current_epoch}, Step {batch_idx}, Token Loss: {token_loss.item()}, Recon Loss: {recon_loss.item()}")
         return loss
 
     def configure_optimizers(self):
@@ -209,6 +222,7 @@ class SVDAutoRegressiveModel(pl.LightningModule):
             reconstructed = reconstructed + sigma_i.unsqueeze(-1) * outer
         return reconstructed
 
+
 # --------------------------
 # Data Module for CIFAR-10
 # --------------------------
@@ -238,6 +252,7 @@ class CIFAR10DataModule(pl.LightningDataModule):
 
     def val_dataloader(self):
         return DataLoader(self.cifar10_val, batch_size=self.batch_size, shuffle=False, num_workers=4)
+
 
 # import matplotlib.pyplot as plt
 # def display_samples(img, outputs):
@@ -272,18 +287,13 @@ class CIFAR10DataModule(pl.LightningDataModule):
 #             display_samples(img, outputs)
 
 
-
-
-
-
-
 # --------------------------
 # Main: Training the Model
 # --------------------------
 if __name__ == "__main__":
     dm = CIFAR10DataModule(batch_size=64, k_components=10)
     model = SVDAutoRegressiveModel(latent_dim=128, k_components=10, image_size=32)
-    trainer = pl.Trainer(max_epochs=50, accelerator="auto", fast_dev_run=False, enable_progress_bar=False)
+    trainer = pl.Trainer(max_epochs=10, accelerator="auto", fast_dev_run=False, enable_progress_bar=False)
     trainer.fit(model, dm)
 
     # Switch to evaluation mode.
@@ -306,4 +316,3 @@ if __name__ == "__main__":
         axs[i].imshow(generated_images[i], cmap='gray')
         axs[i].axis('off')
     plt.show()
-
