@@ -18,3 +18,7 @@ local_output*
 *.log
 *.txt
 *.ipynb
+*.yaml
+/data/cifar-10-batches-py
+*.gz
+/lightning_logs
