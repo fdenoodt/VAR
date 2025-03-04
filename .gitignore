@@ -22,3 +22,4 @@ local_output*
 /data/cifar-10-batches-py
 *.gz
 /lightning_logs
+/data/MNIST
