@@ -118,8 +118,6 @@ if __name__ == '__main__':
     train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True, num_workers=4)
     val_loader = DataLoader(val_dataset, batch_size=64, shuffle=True, num_workers=4)
 
-
-
     # Initialize the model.
     model = SVDPredictor(m=28, n=28, hidden_dim=256)
 

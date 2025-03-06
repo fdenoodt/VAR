@@ -12,13 +12,15 @@ from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
 
 
+# gpt: SharedAdaLin: A helper linear layer that reshapes its output to a shape suitable for adaptive layer‑normalization.
 class SharedAdaLin(nn.Linear):
-    def forward(self, cond_BD):
+    def forward(self, cond_BD):  # cond_db stands for condition batch dimension
         C = self.weight.shape[0] // 6
         return super().forward(cond_BD).view(-1, 1, 6, C)  # B16C
 
 
 class VAR(nn.Module):
+    # gpt: Initialization (init): Sets up hyperparameters, creates embeddings (word, class, positional, and level embeddings), builds the transformer backbone (a stack of AdaLN‑based self‑attention blocks), and prepares an attention mask for training.
     def __init__(
             self, vae_local: VQVAE,
             num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0.,
@@ -42,8 +44,9 @@ class VAR(nn.Module):
         self.first_l = self.patch_nums[0] ** 2
         self.begin_ends = []
         cur = 0
-        for i, pn in enumerate(self.patch_nums):
-            self.begin_ends.append((cur, cur + pn ** 2))
+        # split the whole image into different levels of token pyramid
+        for i, pn in enumerate(self.patch_nums):  # pn: patch number
+            self.begin_ends.append((cur, cur + pn ** 2)) # says where each level starts and ends
             cur += pn ** 2
 
         self.num_stages_minus_1 = len(self.patch_nums) - 1
@@ -60,7 +63,7 @@ class VAR(nn.Module):
         self.num_classes = num_classes
         self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32,
                                        device=dist.get_device())
-        self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
+        self.class_emb = nn.Embedding(self.num_classes + 1, self.C) # integer label to vector
         nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
@@ -121,6 +124,7 @@ class VAR(nn.Module):
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)
 
+    # gpt: get_logits: Processes the transformer’s output (with or without residual fusion) to compute the final logits over the discrete codebook (vocabulary).
     def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]],
                    cond_BD: Optional[torch.Tensor]):
         if not isinstance(h_or_h_and_residual, torch.Tensor):
@@ -130,6 +134,7 @@ class VAR(nn.Module):
             h = h_or_h_and_residual
         return self.head(self.head_nm(h.float(), cond_BD).float()).float()
 
+    # gpt: autoregressive_infer_cfg: Implements the inference routine. It runs the model in a loop over the different “scales” (or stages) of the image. At each stage, it uses classifier‑free guidance and top‑k/top‑p sampling to sample the next token map, then feeds that into the VQVAE’s helper function to update the latent representation.
     @torch.no_grad()
     def autoregressive_infer_cfg(
             self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
@@ -159,29 +164,35 @@ class VAR(nn.Module):
             label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B,
                                  device=self.lvl_1L.device)
 
+        # in: tensor die dubbel zo lang
         sos = cond_BD = self.class_emb(
-            torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+            torch.cat((label_B,
+                       torch.full_like(label_B, fill_value=self.num_classes) # [dog, dog dog ... dog (8)] -> [dog, dog dog ... dog (8) | eos eos ... eos (8)]
+                       ), dim=0))
         # 16x1024 (where 16 is the batch size, 1024 is the embedding size)
         # sos stands for start of sequence
         # cond_BD: B, D where B is batch size, D is cond_dim
 
         # level pos is used to distinguish different levels of token pyramid (1, 680, 1024)
         lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC  #
-        next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l,
-                                                                                                  -1) + lvl_pos[:,
-                                                                                                        :self.first_l]
+        next_token_map = (sos.unsqueeze(1).expand(2 * B, self.first_l, -1) +
+                          self.pos_start.expand(2 * B, self.first_l, -1) +
+                          lvl_pos[:, :self.first_l])
 
         cur_L = 0
+        # new_zeros: Returns a new tensor with the same size as self and filled with zeros.
+        # B = batch size, Cvae = embedding size, patch_nums[-1] = 16
         f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        # (8, 32, 16, 16)
 
         for b in self.blocks:
             b.attn.kv_caching(True)
 
+        # iterate over different scales
         for si, pn in enumerate(self.patch_nums):  # si: i-th segment
             ratio = si / self.num_stages_minus_1
             # last_L = cur_L
             cur_L += pn * pn
-            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
             cond_BD_or_gss = self.shared_ada_lin(cond_BD)
             x = next_token_map
             # AdaLNSelfAttn.forward
@@ -201,6 +212,8 @@ class VAR(nn.Module):
                          self.vae_quant_proxy[0].embedding.weight.unsqueeze(0)
 
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
+
+            # hierin wordt de f_hat geupdate, gaat naar volgende f (hogere resolutie). get_next_autoregressive_input doet interpolatie naar hogere resolutie
             f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums),
                                                                                           f_hat, h_BChw)
             if si != self.num_stages_minus_1:  # prepare for next stage
@@ -215,6 +228,7 @@ class VAR(nn.Module):
         out = self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)  # de-normalize, from [-1, 1] to [0, 1]
         return out  # recon_B3HW
 
+    # gpt: forward: Defines the forward pass for training (teacher‑forcing mode). It builds an input sequence (by concatenating a “start‑of‑sequence” token with teacher tokens), adds positional and level information, and then passes everything through the transformer blocks to produce output logits.
     def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
         """
         :param label_B: label_B
@@ -261,6 +275,7 @@ class VAR(nn.Module):
                 x_BLC[0, 0, 0] += s
         return x_BLC  # logits BLV, V is vocab_size
 
+    # gpt: init_weights: A helper function that custom‑initializes the weights for various sub‑modules.
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
         if init_std < 0: init_std = (1 / self.C / 3) ** 0.5  # init_std < 0: automated
 
@@ -322,6 +337,7 @@ class VAR(nn.Module):
         return f'drop_path_rate={self.drop_path_rate:g}'
 
 
+# gpt: VARHF Class: A thin wrapper over VAR (and a mixin from Hugging Face) that automatically builds a VQVAE from given parameters and then initializes VAR using it.
 class VARHF(VAR, PyTorchModelHubMixin):
     # repo_url="https://github.com/FoundationVision/VAR",
     # tags=["image-generation"]):
